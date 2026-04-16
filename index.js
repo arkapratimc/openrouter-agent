@@ -5,8 +5,8 @@ import { execa } from 'execa';
 import { blue, green, red, yellow, bold, cyan } from 'colorette';
 
 // --- CONFIGURATION ---
-const OPENROUTER_API_KEY = "whatever, payment required lol";
-const MODEL = "openai/gpt-5.2";
+const OPENROUTER_API_KEY = "whatever...";
+const MODEL = "openai/gpt-oss-120b:free";
 const RETRY_LIMIT = 3;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
