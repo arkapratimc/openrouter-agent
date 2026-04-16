@@ -1,70 +1,123 @@
+import fs from 'fs/promises';
+import path from 'path';
+import readline from 'readline/promises';
 import { execa } from 'execa';
-import { blue, green, red, yellow, bold } from 'colorette';
-import axios from 'axios'; // For the OpenRouter calls
+import { blue, green, red, yellow, bold, cyan } from 'colorette';
 
-const RECENT_LOGS = [];
+// --- CONFIGURATION ---
+const OPENROUTER_API_KEY = "whatever, payment required lol";
+const MODEL = "openai/gpt-5.2";
 const RETRY_LIMIT = 3;
 
-async function runCactroSprints(userPrompt) {
-    console.log(blue(bold("🚀 Starting Cactro V1...")));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-    // 1. PRD SYNTHESIZER
-    const spec = await callOpenRouter("PRD_PROMPT", userPrompt);
-    console.log(green("✔ Spec synthesized. Target: " + spec.techStack));
-
-    // 2. LLM CORE (Plan & Generate)
-    const files = await callOpenRouter("GENERATE_PROMPT", spec);
-    
-    // 3. TOOL ORCHESTRATOR (File Creation)
-    for (const file of files) {
-        await fs.writeFile(file.name, file.content);
-        console.log(yellow(`📝 Created ${file.name}`));
-    }
-
-    // 4. EXECUTION + SELF-EVALUATION LOOP
-    let attempt = 0;
-    let success = false;
-
-    while (attempt < RETRY_LIMIT && !success) {
-        attempt++;
-        console.log(blue(`\n🔍 Evaluation Attempt ${attempt}/${RETRY_LIMIT}`));
-
-        try {
-            // Start the app (detecting if it's npm start or uvicorn)
-            const command = spec.techStack === 'fastapi' ? 'uvicorn' : 'node';
-            const args = spec.techStack === 'fastapi' ? ['main:app', '--port', '3000'] : ['index.js'];
-            
-            const subprocess = execa(command, args);
-            
-            // Wait 2 seconds for boot then CURL
-            await sleep(2000);
-            const { stdout } = await execa('curl', ['-I', 'http://localhost:3000']);
-
-            if (stdout.includes("200 OK")) {
-                console.log(green(bold("✅ PASS: App is responsive!")));
-                success = true;
-                subprocess.kill(); 
-            } else {
-                throw new Error("CURL failed to see 200 OK");
-            }
-
-        } catch (err) {
-            console.log(red(`❌ FAIL: ${err.message}`));
-            
-            // FEEDBACK TO LLM CORE
-            const fix = await callOpenRouter("DEBUG_PROMPT", {
-                error: err.message,
-                files: files
-            });
-            
-            // Apply Fixes
-            await applyFixes(fix);
-        }
-    }
-
-    if (success) {
-        console.log(green(bold("\n✨ MVP SHIPPED SUCCESSFULLY")));
-    } else {
-        console.log(red(bold("\n🚫 MVP FAILED AFTER 3 RETRIES. Check logs.")));
-    }
+async function callOpenRouter(system, prompt) {
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          { role: "system", content: system + " Respond ONLY with valid JSON. No prose." },
+          { role: "user", content: prompt }
+        ],
+        response_format: { type: "json_object" }
+      })
+    });
+    console.log(response);
+    const data = await response.json();
+    const content = data.choices[0].message.content;
+    return JSON.parse(content);
+  } catch (err) {
+    console.error(red("OpenRouter Error: " + err.message));
+    process.exit(1);
+  }
 }
+
+async function runCactroSprints() {
+  console.log(cyan(bold("\n--- CACTRO AGENT V1 (NODE + EXECA) ---")));
+  
+  const userPrompt = await rl.question(bold("What do you want to build? "));
+  const dirName = await rl.question(bold("Enter directory name for the project: "));
+  const targetDir = path.resolve(process.cwd(), dirName);
+
+  // 1. PRD SYNTHESIZER
+  const spec = await callOpenRouter(
+    "Analyze user intent. Output JSON: { techStack: 'nodejs' | 'fastapi', appDescription: string }",
+    userPrompt
+  );
+  console.log(green(`✔ Target Stack: ${spec.techStack}`));
+
+  // 2. LLM CORE (Generate)
+  let projectData = await callOpenRouter(
+    `Generate a single-file app for ${spec.techStack}. Use port 3000. Output JSON: { files: [{ name: string, content: string }] }`,
+    spec.appDescription
+  );
+
+  // Ensure directory exists
+  await fs.mkdir(targetDir, { recursive: true });
+
+  let attempt = 0;
+  let success = false;
+
+  while (attempt < RETRY_LIMIT && !success) {
+    attempt++;
+    console.log(blue(`\n🔍 Attempt ${attempt}/${RETRY_LIMIT}`));
+
+    // 3. TOOL ORCHESTRATOR
+    for (const file of projectData.files) {
+      const filePath = path.join(targetDir, file.name);
+      await fs.writeFile(filePath, file.content);
+      console.log(yellow(`  📝 Written: ${file.name} in ${dirName}/`));
+    }
+
+    let subprocess;
+    try {
+      console.log(cyan("  ⚙️ Starting server..."));
+      
+      // Using execa template literals with .opt to set the working directory
+      if (spec.techStack === 'fastapi') {
+        subprocess = execa({ cwd: targetDir })`uvicorn main:app --host 127.0.0.1 --port 3000`;
+      } else {
+        const entryFile = projectData.files[0].name;
+        subprocess = execa({ cwd: targetDir })`node ${entryFile}`;
+      }
+
+      await sleep(2500); // Boot time
+
+      // 4. SELF-EVALUATION (CURL)
+      console.log(cyan("  🧪 Testing endpoint..."));
+      const { stdout } = await execa`curl -I http://127.0.0.1:3000`;
+
+      if (stdout.includes("200")) {
+        console.log(green(bold("  ✅ PASS: App is alive!")));
+        success = true;
+      } else {
+        throw new Error("Server responded but not with 200 OK");
+      }
+    } catch (err) {
+      const errorLog = err.all || err.message;
+      console.log(red(`  ❌ FAIL: ${errorLog}`));
+      
+      if (attempt < RETRY_LIMIT) {
+        console.log(blue("  🔧 Asking LLM for a fix..."));
+        projectData = await callOpenRouter(
+          "The previous code failed. Fix the errors. Output JSON: { files: [{ name: string, content: string }] }",
+          `Error: ${errorLog}\nCurrent Files: ${JSON.stringify(projectData.files)}`
+        );
+      }
+    } finally {
+      if (subprocess) subprocess.kill();
+    }
+  }
+
+  success ? console.log(green(bold(`\n✨ SHIPPED! Check the "${dirName}" folder.`))) : console.log(red(bold("\n🚫 FAILED.")));
+  rl.close();
+}
+
+runCactroSprints();
