@@ -5,33 +5,35 @@ import { execa } from 'execa';
 import { blue, green, red, yellow, bold, cyan } from 'colorette';
 
 // --- CONFIGURATION ---
-const OPENROUTER_API_KEY = "whatever...";
-const MODEL = "openai/gpt-oss-120b:free";
+const MODEL = "qwen/qwen3-4b-2507";
+const LMSTUDIO_URL = "http://localhost:1234/api/v1/chat";
 const RETRY_LIMIT = 3;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-async function callOpenRouter(system, prompt) {
+async function callLMStudio(system, prompt) {
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const response = await fetch(LMSTUDIO_URL, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
         model: MODEL,
-        messages: [
-          { role: "system", content: system + " Respond ONLY with valid JSON. No prose." },
-          { role: "user", content: prompt }
-        ],
-        response_format: { type: "json_object" }
+        system_prompt: system + " Respond ONLY with valid JSON. No prose.",
+        input: prompt
       })
     });
-    console.log(response);
+    // console.log(response);
     const data = await response.json();
-    const content = data.choices[0].message.content;
+    const content = data.output?.find(item => item.type === "message")?.content;
+
+    if (!content) {
+      throw new Error("LM Studio returned no message content");
+    }
+
     return JSON.parse(content);
   } catch (err) {
     console.error(red("OpenRouter Error: " + err.message));
@@ -41,20 +43,30 @@ async function callOpenRouter(system, prompt) {
 
 async function runCactroSprints() {
   console.log(cyan(bold("\n--- CACTRO AGENT V1 (NODE + EXECA) ---")));
-  
+
   const userPrompt = await rl.question(bold("What do you want to build? "));
   const dirName = await rl.question(bold("Enter directory name for the project: "));
-  const targetDir = path.resolve(process.cwd(), dirName);
+  // PATH VALIDATION LOGIC:
+  // 1. Prevent empty strings
+  // 2. Prevent path traversal (no dots, no slashes)
+  const isValidName = /^[a-zA-Z0-9_-]+$/.test(dirName);
+
+  if (!isValidName) {
+    console.error(red("Invalid directory name! Use only letters, numbers, hyphens, or underscores."));
+    process.exit(1);
+  }
+
+  const targetDir = path.resolve(process.cwd(), "..", dirName);
 
   // 1. PRD SYNTHESIZER
-  const spec = await callOpenRouter(
+  const spec = await callLMStudio(
     "Analyze user intent. Output JSON: { techStack: 'nodejs' | 'fastapi', appDescription: string }",
     userPrompt
   );
   console.log(green(`✔ Target Stack: ${spec.techStack}`));
 
   // 2. LLM CORE (Generate)
-  let projectData = await callOpenRouter(
+  let projectData = await callLMStudio(
     `Generate a single-file app for ${spec.techStack}. Use port 3000. Output JSON: { files: [{ name: string, content: string }] }`,
     spec.appDescription
   );
@@ -79,13 +91,13 @@ async function runCactroSprints() {
     let subprocess;
     try {
       console.log(cyan("  ⚙️ Starting server..."));
-      
+
       // Using execa template literals with .opt to set the working directory
       if (spec.techStack === 'fastapi') {
-        subprocess = execa({ cwd: targetDir })`uvicorn main:app --host 127.0.0.1 --port 3000`;
+        subprocess = execa({ cwd: targetDir, reject: false })`uvicorn main:app --host 127.0.0.1 --port 3000`;
       } else {
         const entryFile = projectData.files[0].name;
-        subprocess = execa({ cwd: targetDir })`node ${entryFile}`;
+        subprocess = execa({ cwd: targetDir, reject: false })`node ${entryFile}`;
       }
 
       await sleep(2500); // Boot time
@@ -103,10 +115,10 @@ async function runCactroSprints() {
     } catch (err) {
       const errorLog = err.all || err.message;
       console.log(red(`  ❌ FAIL: ${errorLog}`));
-      
+
       if (attempt < RETRY_LIMIT) {
         console.log(blue("  🔧 Asking LLM for a fix..."));
-        projectData = await callOpenRouter(
+        projectData = await callLMStudio(
           "The previous code failed. Fix the errors. Output JSON: { files: [{ name: string, content: string }] }",
           `Error: ${errorLog}\nCurrent Files: ${JSON.stringify(projectData.files)}`
         );
@@ -116,7 +128,39 @@ async function runCactroSprints() {
     }
   }
 
-  success ? console.log(green(bold(`\n✨ SHIPPED! Check the "${dirName}" folder.`))) : console.log(red(bold("\n🚫 FAILED.")));
+  if (success) {
+    console.log(green(bold(`\n✨ SHIPPED! Check the "${dirName}" folder.`)));
+
+    // POST-SUCCESS ITERATION LOOP
+    while (true) {
+      const modification = await rl.question(bold("\n🔧 Want to modify? (describe change or type 'exit'): "));
+
+      if (modification.toLowerCase() === 'exit') {
+        console.log(cyan("👋 Done. Goodbye!"));
+        break;
+      }
+
+      console.log(blue("  ✏️ Asking LLM to update the code..."));
+
+      projectData = await callLMStudio(
+        `Modify the existing ${spec.techStack} app. Keep all current functionality. Output JSON: { files: [{ name: string, content: string }] }`,
+        `Current files: ${JSON.stringify(projectData.files)}\n\nUser request: ${modification}`
+      );
+
+      // Write updated files
+      for (const file of projectData.files) {
+        const filePath = path.join(targetDir, file.name);
+        await fs.writeFile(filePath, file.content);
+        console.log(yellow(`  📝 Updated: ${file.name}`));
+      }
+
+      console.log(green(bold("  ✅ Changes applied!")));
+    }
+
+  } else {
+    console.log(red(bold("\n🚫 FAILED.")));
+  }
+
   rl.close();
 }
 
