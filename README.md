@@ -1,5 +1,5 @@
 
-PROJECT: CACTRO AGENT V1 (Vibe-to-Code MVP)
+PROJECT: CACTRO AGENT V1 
 ===========================================
 
 PREREQUISITES
