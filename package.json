@@ -12,6 +12,7 @@
   "type": "module",
   "dependencies": {
     "colorette": "^2.0.20",
-    "execa": "^9.6.1"
+    "execa": "^9.6.1",
+    "jsonrepair": "^3.14.0"
   }
 }

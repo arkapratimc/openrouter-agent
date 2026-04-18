@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import { jsonrepair } from 'jsonrepair';
 import path from 'path';
 import readline from 'readline/promises';
 import { execa } from 'execa';
@@ -17,7 +18,6 @@ async function callLMStudio(system, prompt) {
     const response = await fetch(LMSTUDIO_URL, {
       method: "POST",
       headers: {
-
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -26,7 +26,6 @@ async function callLMStudio(system, prompt) {
         input: prompt
       })
     });
-    // console.log(response);
     const data = await response.json();
     const content = data.output?.find(item => item.type === "message")?.content;
 
@@ -34,10 +33,122 @@ async function callLMStudio(system, prompt) {
       throw new Error("LM Studio returned no message content");
     }
 
-    return JSON.parse(content);
+    let cleaned = content.replace(/```json|```/g, "").trim();
+
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      console.log(yellow("  ⚠️  Malformed JSON detected, attempting repair..."));
+      const repaired = jsonrepair(cleaned);
+      return JSON.parse(repaired);
+    }
+    return JSON.parse(cleaned);
   } catch (err) {
-    console.error(red("OpenRouter Error: " + err.message));
+    console.error(red("LM Studio Error: " + err.message));
     process.exit(1);
+  }
+}
+
+// Extracts all route paths from generated files so we can test them
+async function getEndpoints(projectData) {
+  try {
+    const result = await callLMStudio(
+      `Analyze the given code files. List ALL HTTP endpoints. Output JSON: { endpoints: [{ method: "GET"|"POST"|"PUT"|"DELETE", path: string, expectedStatus: number }] }`,
+      `Files: ${JSON.stringify(projectData.files)}`
+    );
+    return result.endpoints || [];
+  } catch {
+    // Fallback: just test root
+    return [{ method: "GET", path: "/", expectedStatus: 200 }];
+  }
+}
+
+// Tests all endpoints against the running server
+async function testAllEndpoints(endpoints) {
+  const results = [];
+
+  for (const ep of endpoints) {
+    const url = `http://127.0.0.1:3000${ep.path}`;
+    const method = ep.method.toUpperCase();
+
+    try {
+      let stdout;
+
+      if (method === "GET") {
+        ({ stdout } = await execa`curl -s -o NUL -w %{http_code} ${url}`);
+      } else {
+        ({ stdout } = await execa`curl -s -o NUL -w "%{http_code}" -X ${method} ${url}`);
+      }
+
+      const statusCode = stdout.trim().replace(/"/g, "");
+      const passed = ep.expectedStatus
+        ? parseInt(statusCode) === ep.expectedStatus
+        : (statusCode.startsWith("2") || statusCode.startsWith("3"));
+
+      results.push({ ...ep, statusCode, passed });
+
+      if (passed) {
+        console.log(green(`    ✅ ${method} ${ep.path} → ${statusCode}`));
+      } else {
+        console.log(red(`    ❌ ${method} ${ep.path} → ${statusCode} (expected ${ep.expectedStatus})`));
+      }
+    } catch (err) {
+      results.push({ ...ep, statusCode: "ERR", passed: false });
+      console.log(red(`    ❌ ${method} ${ep.path} → FAILED (${err.message})`));
+    }
+  }
+
+  return results;
+}
+async function waitForServer(url, maxAttempts = 10) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      await execa`curl -s -o NUL ${url}`;
+      return true; // Server is up
+    } catch {
+      await sleep(500); // Wait 500ms and retry
+    }
+  }
+  return false; // Server never came up
+}
+// Starts server, tests all endpoints, kills server
+async function startAndTest(spec, projectData, targetDir) {
+  let subprocess;
+
+  try {
+    console.log(cyan("  ⚙️  Starting server..."));
+
+    if (spec.techStack === 'fastapi') {
+      subprocess = execa({ cwd: targetDir, reject: false })`uvicorn main:app --host 127.0.0.1 --port 3000`;
+    } else {
+      const entryFile = projectData.files[0].name;
+      subprocess = execa({ cwd: targetDir, reject: false })`node ${entryFile}`;
+    }
+
+    const serverReady = await waitForServer("http://127.0.0.1:3000");
+
+    if (!serverReady) {
+      console.log(red("  ❌ Server never became ready"));
+      return { allPassed: false, results: [] };
+    }
+    console.log(green("  ✅ Server is ready!"));
+
+    // Discover all endpoints from the code
+    console.log(cyan("  🔍 Discovering endpoints..."));
+    const endpoints = await getEndpoints(projectData);
+    console.log(cyan(`  🧪 Testing ${endpoints.length} endpoint(s)...`));
+
+    const results = await testAllEndpoints(endpoints);
+    const allPassed = results.every(r => r.passed);
+
+    return { allPassed, results };
+  } catch (err) {
+    console.log(red(`  ❌ Server error: ${err.message}`));
+    // ADD THIS TO SEE THE ACTUAL CODE ERROR:
+    if (subprocess && subprocess.all) console.log(yellow(subprocess.all));
+    return { allPassed: false, results: [] };
+  } finally {
+    if (subprocess) subprocess.kill();
   }
 }
 
@@ -46,11 +157,8 @@ async function runCactroSprints() {
 
   const userPrompt = await rl.question(bold("What do you want to build? "));
   const dirName = await rl.question(bold("Enter directory name for the project: "));
-  // PATH VALIDATION LOGIC:
-  // 1. Prevent empty strings
-  // 2. Prevent path traversal (no dots, no slashes)
-  const isValidName = /^[a-zA-Z0-9_-]+$/.test(dirName);
 
+  const isValidName = /^[a-zA-Z0-9_-]+$/.test(dirName);
   if (!isValidName) {
     console.error(red("Invalid directory name! Use only letters, numbers, hyphens, or underscores."));
     process.exit(1);
@@ -67,13 +175,14 @@ async function runCactroSprints() {
 
   // 2. LLM CORE (Generate)
   let projectData = await callLMStudio(
-    `Generate a single-file app for ${spec.techStack}. Use port 3000. Output JSON: { files: [{ name: string, content: string }] }`,
+    `Generate a single-file app for ${spec.techStack}. Use port 3000. Use ONLY built-in modules. Output JSON: { files: [{ name: string, content: string }] }`,
     spec.appDescription
   );
 
   // Ensure directory exists
   await fs.mkdir(targetDir, { recursive: true });
 
+  // 3. BUILD + TEST LOOP
   let attempt = 0;
   let success = false;
 
@@ -81,57 +190,35 @@ async function runCactroSprints() {
     attempt++;
     console.log(blue(`\n🔍 Attempt ${attempt}/${RETRY_LIMIT}`));
 
-    // 3. TOOL ORCHESTRATOR
     for (const file of projectData.files) {
       const filePath = path.join(targetDir, file.name);
       await fs.writeFile(filePath, file.content);
       console.log(yellow(`  📝 Written: ${file.name} in ${dirName}/`));
     }
 
-    let subprocess;
-    try {
-      console.log(cyan("  ⚙️ Starting server..."));
+    const { allPassed, results } = await startAndTest(spec, projectData, targetDir);
 
-      // Using execa template literals with .opt to set the working directory
-      if (spec.techStack === 'fastapi') {
-        subprocess = execa({ cwd: targetDir, reject: false })`uvicorn main:app --host 127.0.0.1 --port 3000`;
-      } else {
-        const entryFile = projectData.files[0].name;
-        subprocess = execa({ cwd: targetDir, reject: false })`node ${entryFile}`;
-      }
-
-      await sleep(2500); // Boot time
-
-      // 4. SELF-EVALUATION (CURL)
-      console.log(cyan("  🧪 Testing endpoint..."));
-      const { stdout } = await execa`curl -I http://127.0.0.1:3000`;
-
-      if (stdout.includes("200")) {
-        console.log(green(bold("  ✅ PASS: App is alive!")));
-        success = true;
-      } else {
-        throw new Error("Server responded but not with 200 OK");
-      }
-    } catch (err) {
-      const errorLog = err.all || err.message;
-      console.log(red(`  ❌ FAIL: ${errorLog}`));
+    if (allPassed) {
+      console.log(green(bold("  ✅ ALL TESTS PASSED!")));
+      success = true;
+    } else {
+      const failedTests = results.filter(r => !r.passed);
+      console.log(red(`  ❌ ${failedTests.length} test(s) failed`));
 
       if (attempt < RETRY_LIMIT) {
         console.log(blue("  🔧 Asking LLM for a fix..."));
         projectData = await callLMStudio(
-          "The previous code failed. Fix the errors. Output JSON: { files: [{ name: string, content: string }] }",
-          `Error: ${errorLog}\nCurrent Files: ${JSON.stringify(projectData.files)}`
+          "The previous code failed some tests. Fix the errors. Output JSON: { files: [{ name: string, content: string }] }",
+          `Failed tests: ${JSON.stringify(failedTests)}\nCurrent Files: ${JSON.stringify(projectData.files)}`
         );
       }
-    } finally {
-      if (subprocess) subprocess.kill();
     }
   }
 
+  // 4. POST-SUCCESS ITERATION LOOP
   if (success) {
     console.log(green(bold(`\n✨ SHIPPED! Check the "${dirName}" folder.`)));
 
-    // POST-SUCCESS ITERATION LOOP
     while (true) {
       const modification = await rl.question(bold("\n🔧 Want to modify? (describe change or type 'exit'): "));
 
@@ -140,10 +227,10 @@ async function runCactroSprints() {
         break;
       }
 
-      console.log(blue("  ✏️ Asking LLM to update the code..."));
+      console.log(blue("  ✏️  Asking LLM to update the code..."));
 
       projectData = await callLMStudio(
-        `Modify the existing ${spec.techStack} app. Keep all current functionality. Output JSON: { files: [{ name: string, content: string }] }`,
+        `Modify the existing ${spec.techStack} app. Keep all current functionality. Use ONLY built-in modules. Output JSON: { files: [{ name: string, content: string }] }`,
         `Current files: ${JSON.stringify(projectData.files)}\n\nUser request: ${modification}`
       );
 
@@ -154,11 +241,44 @@ async function runCactroSprints() {
         console.log(yellow(`  📝 Updated: ${file.name}`));
       }
 
-      console.log(green(bold("  ✅ Changes applied!")));
+      // Re-test everything
+      console.log(cyan("\n  🔄 Re-testing all endpoints..."));
+      const { allPassed, results } = await startAndTest(spec, projectData, targetDir);
+
+      if (allPassed) {
+        console.log(green(bold("  ✅ ALL TESTS STILL PASSING!")));
+      } else {
+        const failedTests = results.filter(r => !r.passed);
+        console.log(red(`  ⚠️  ${failedTests.length} test(s) failed after modification`));
+
+        const autofix = await rl.question(bold("  🔧 Want the LLM to auto-fix? (y/n): "));
+
+        if (autofix.toLowerCase() === 'y') {
+          projectData = await callLMStudio(
+            "The modification broke some tests. Fix the code. Output JSON: { files: [{ name: string, content: string }] }",
+            `Failed tests: ${JSON.stringify(failedTests)}\nCurrent Files: ${JSON.stringify(projectData.files)}`
+          );
+
+          for (const file of projectData.files) {
+            const filePath = path.join(targetDir, file.name);
+            await fs.writeFile(filePath, file.content);
+            console.log(yellow(`  📝 Fixed: ${file.name}`));
+          }
+
+          // Test again after fix
+          console.log(cyan("\n  🔄 Re-testing after fix..."));
+          const fixResult = await startAndTest(spec, projectData, targetDir);
+          if (fixResult.allPassed) {
+            console.log(green(bold("  ✅ ALL TESTS PASSING AFTER FIX!")));
+          } else {
+            console.log(red("  ⚠️  Some tests still failing. You can try again."));
+          }
+        }
+      }
     }
 
   } else {
-    console.log(red(bold("\n🚫 FAILED.")));
+    console.log(red(bold("\n🚫 FAILED after all retries.")));
   }
 
   rl.close();
