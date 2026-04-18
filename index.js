@@ -185,8 +185,11 @@ async function startAndTest(spec, projectData, targetDir) {
     if (subprocess) subprocess.kill();
     // Wait for process to fully exit and get output
       const result = await subprocess;
+      // DEBUG — remove after testing
+      // Only show error if server crashed ON ITS OWN (not killed by us)
+      const weCausedIt = result.isTerminated && result.signal === 'SIGTERM';
       
-      if (result.failed || !result.isTerminated) {
+      if (result.failed && !weCausedIt) {
         console.log(red(bold("\n  💥 Server crashed! Here's the error:")));
         console.log(red("  ─────────────────────────────────"));
         console.log(red(`  ${result.stdout || ""}`));
@@ -197,7 +200,7 @@ async function startAndTest(spec, projectData, targetDir) {
 }
 
 async function runCactroSprints() {
-  console.log(cyan(bold("\n--- CACTRO AGENT V1 (NODE + EXECA) ---")));
+  console.log(cyan(bold("\n--- CACTRO AGENT V1 (NODE + FASTAPI) ---")));
 
   const userPrompt = await rl.question(bold("What do you want to build? "));
   const dirName = await rl.question(bold("Enter directory name for the project: "));
