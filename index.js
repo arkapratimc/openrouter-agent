@@ -64,6 +64,42 @@ async function getEndpoints(projectData) {
 }
 
 // Tests all endpoints against the running server
+// async function testAllEndpoints(endpoints) {
+//   const results = [];
+
+//   for (const ep of endpoints) {
+//     const url = `http://127.0.0.1:3000${ep.path}`;
+//     const method = ep.method.toUpperCase();
+
+//     try {
+//       let stdout;
+
+//       if (method === "GET") {
+//         ({ stdout } = await execa`curl -s -o NUL -w %{http_code} ${url}`);
+//       } else {
+//         ({ stdout } = await execa`curl -s -o NUL -w "%{http_code}" -X ${method} ${url}`);
+//       }
+
+//       const statusCode = stdout.trim().replace(/"/g, "");
+//       const passed = ep.expectedStatus
+//         ? parseInt(statusCode) === ep.expectedStatus
+//         : (statusCode.startsWith("2") || statusCode.startsWith("3"));
+
+//       results.push({ ...ep, statusCode, passed });
+
+//       if (passed) {
+//         console.log(green(`    ✅ ${method} ${ep.path} → ${statusCode}`));
+//       } else {
+//         console.log(red(`    ❌ ${method} ${ep.path} → ${statusCode} (expected ${ep.expectedStatus})`));
+//       }
+//     } catch (err) {
+//       results.push({ ...ep, statusCode: "ERR", passed: false });
+//       console.log(red(`    ❌ ${method} ${ep.path} → FAILED (${err.message})`));
+//     }
+//   }
+
+//   return results;
+// }
 async function testAllEndpoints(endpoints) {
   const results = [];
 
@@ -72,17 +108,15 @@ async function testAllEndpoints(endpoints) {
     const method = ep.method.toUpperCase();
 
     try {
-      let stdout;
+      // Use Node's built-in fetch instead of curl
+      const response = await fetch(url, { 
+        method: method,
+        signal: AbortSignal.timeout(5000) // 5s timeout
+      });
 
-      if (method === "GET") {
-        ({ stdout } = await execa`curl -s -o NUL -w %{http_code} ${url}`);
-      } else {
-        ({ stdout } = await execa`curl -s -o NUL -w "%{http_code}" -X ${method} ${url}`);
-      }
-
-      const statusCode = stdout.trim().replace(/"/g, "");
-      const passed = ep.expectedStatus
-        ? parseInt(statusCode) === ep.expectedStatus
+      const statusCode = response.status.toString();
+      const passed = ep.expectedStatus 
+        ? parseInt(statusCode) === ep.expectedStatus 
         : (statusCode.startsWith("2") || statusCode.startsWith("3"));
 
       results.push({ ...ep, statusCode, passed });
@@ -119,10 +153,10 @@ async function startAndTest(spec, projectData, targetDir) {
     console.log(cyan("  ⚙️  Starting server..."));
 
     if (spec.techStack === 'fastapi') {
-      subprocess = execa({ cwd: targetDir, reject: false })`uvicorn main:app --host 127.0.0.1 --port 3000`;
+      subprocess = execa({ cwd: targetDir, reject: false, all: true })`uvicorn main:app --host 127.0.0.1 --port 3000`;
     } else {
       const entryFile = projectData.files[0].name;
-      subprocess = execa({ cwd: targetDir, reject: false })`node ${entryFile}`;
+      subprocess = execa({ cwd: targetDir, reject: false, all: true })`node ${entryFile}`;
     }
 
     const serverReady = await waitForServer("http://127.0.0.1:3000");
@@ -149,6 +183,16 @@ async function startAndTest(spec, projectData, targetDir) {
     return { allPassed: false, results: [] };
   } finally {
     if (subprocess) subprocess.kill();
+    // Wait for process to fully exit and get output
+      const result = await subprocess;
+      
+      if (result.failed || !result.isTerminated) {
+        console.log(red(bold("\n  💥 Server crashed! Here's the error:")));
+        console.log(red("  ─────────────────────────────────"));
+        console.log(red(`  ${result.stdout || ""}`));
+        console.log(red(`  ${result.stderr || ""}`));
+        console.log(red("  ─────────────────────────────────\n"));
+      }
   }
 }
 
